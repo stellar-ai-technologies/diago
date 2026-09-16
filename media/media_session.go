@@ -4,6 +4,7 @@
 package media
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -163,9 +164,10 @@ type MediaSession struct {
 	writeRTPBuf  []byte
 
 	// SRTP
-	localCtxSRTP  *srtp.Context
-	remoteCtxSRTP *srtp.Context
-	srtpRemoteTag int
+	localCtxSRTP       *srtp.Context
+	remoteCtxSRTP      *srtp.Context
+	srtpRemoteTag      int
+	remoteSDESLifetime *sdesKeyLifetime
 
 	// RTP NAT enables handling RTP behind NAT. Checkout also RTPSourceLock
 	RTPNAT          int // 0 - disabled, 1 - Learn source change (RTP Symetric)
@@ -296,17 +298,18 @@ func (s *MediaSession) StartRTP(rw int8) error {
 // It preserves pointer to same conneciton but rest is removed
 func (s *MediaSession) Fork() *MediaSession {
 	cp := MediaSession{
-		Laddr:          s.Laddr, // TODO clone it although it is read only
-		ExternalIP:     slices.Clone(s.ExternalIP),
-		rtpConn:        s.rtpConn,
-		rtcpConn:       s.rtcpConn,
-		Codecs:         slices.Clone(s.Codecs),
-		Mode:           s.Mode,
-		RTPNAT:         s.RTPNAT,
-		sdp:            slices.Clone(s.sdp),
-		sessionID:      s.sessionID,
-		sessionVersion: s.sessionVersion,
-		DTLSConf:       s.DTLSConf,
+		Laddr:              s.Laddr, // TODO clone it although it is read only
+		ExternalIP:         slices.Clone(s.ExternalIP),
+		rtpConn:            s.rtpConn,
+		rtcpConn:           s.rtcpConn,
+		Codecs:             slices.Clone(s.Codecs),
+		Mode:               s.Mode,
+		RTPNAT:             s.RTPNAT,
+		sdp:                slices.Clone(s.sdp),
+		sessionID:          s.sessionID,
+		sessionVersion:     s.sessionVersion,
+		DTLSConf:           s.DTLSConf,
+		remoteSDESLifetime: s.remoteSDESLifetime,
 	}
 	return &cp
 }
@@ -571,11 +574,9 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 				continue
 			}
 
-			inline := strings.TrimPrefix(vals[2], "inline:")
-
-			keyBytes, err := base64.StdEncoding.DecodeString(inline)
+			keyBytes, lifetime, err := parseSDESInline(vals[2])
 			if err != nil {
-				return fmt.Errorf("failed to decode SDES key: %v", err)
+				return err
 			}
 			if len(keyBytes) != 30 {
 				return fmt.Errorf("expected 30-byte key, got %d", len(keyBytes))
@@ -589,6 +590,14 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 				return fmt.Errorf("CreateContext failed: %v", err)
 			}
 			s.remoteCtxSRTP = ctx
+			if prev := s.remoteSDESLifetime; prev != nil && bytes.Equal(prev.key, keyBytes) {
+				// A re-offer cannot extend the lifetime of an existing master key.
+				prev.mu.Lock()
+				prev.limit = min(prev.limit, lifetime)
+				prev.mu.Unlock()
+			} else {
+				s.remoteSDESLifetime = &sdesKeyLifetime{key: keyBytes, limit: lifetime}
+			}
 
 			break
 		}
@@ -708,6 +717,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 			if err != nil {
 				return fmt.Errorf("failed to create SRTP context: %w", err)
 			}
+			s.remoteSDESLifetime = nil
 
 			if s.localCtxSRTP == nil && s.remoteCtxSRTP == nil {
 				panic("no context setup")
@@ -862,6 +872,9 @@ func (m *MediaSession) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 		if err != nil {
 			return n, fmt.Errorf("Read SRTP Decrypt error: %w", err)
 		}
+		if err := m.remoteSDESLifetime.accept(false); err != nil {
+			return 0, err
+		}
 		if len(decrypted) > len(buf) {
 			DefaultLogger().Warn("Growing Decrypted RTP buffer", "diff", len(decrypted)-len(buf))
 		}
@@ -963,9 +976,11 @@ func (m *MediaSession) ReadRTCP(buf []byte, pkts []rtcp.Packet) (n int, err erro
 
 	if m.remoteCtxSRTP != nil {
 		data, err = m.remoteCtxSRTP.DecryptRTCP(data, data, nil)
-		if err != nil && false {
-			// For some unknown cases Decryption could fail
+		if err != nil {
 			return 0, errors.Join(errRTCPFailedToUnmarshal, err)
+		}
+		if err := m.remoteSDESLifetime.accept(true); err != nil {
+			return 0, err
 		}
 	}
 
