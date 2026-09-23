@@ -367,7 +367,8 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 
 	server.OnInfo(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
 		// Handle DTMF out of band
-		if req.ContentType().Value() != "application/dtmf-relay" {
+		contentType := req.ContentType()
+		if contentType == nil || contentType.Value() != "application/dtmf-relay" {
 			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptable, "Not Acceptable", nil))
 		}
 

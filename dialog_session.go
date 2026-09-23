@@ -66,7 +66,12 @@ func dialogRefer(ctx context.Context, d DialogSession, recipient sip.Uri, referT
 
 func dialogHandleReferNotify(d DialogSession, req *sip.Request, tx sip.ServerTransaction, onReferNotify func(statusCode int)) {
 	// TODO how to know this is refer
-	contentType := req.ContentType().Value()
+	contentTypeHeader := req.ContentType()
+	if contentTypeHeader == nil {
+		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
+		return
+	}
+	contentType := contentTypeHeader.Value()
 	// For now very basic check
 	if !strings.HasPrefix(contentType, "message/sipfrag") {
 		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
