@@ -631,23 +631,13 @@ func (d *DialogMedia) PlaybackCreate() (AudioPlayback, error) {
 
 // PlaybackControlCreate creates playback for audio with controls like mute unmute
 func (d *DialogMedia) PlaybackControlCreate() (AudioPlaybackControl, error) {
-	// NOTE we should avoid returning pointers for any IN dialplan to avoid heap
-	mprops := MediaProps{}
-	w := d.audioWriterProps(&mprops)
-
-	if w == nil {
-		return AudioPlaybackControl{}, fmt.Errorf("no media setup")
+	p, err := d.PlaybackCreate()
+	if err != nil {
+		return AudioPlaybackControl{}, err
 	}
 	// Audio is controled via audio reader/writer
-	control := &audioControl{
-		Writer: w,
-	}
-
-	p := AudioPlaybackControl{
-		AudioPlayback: NewAudioPlayback(control, mprops.Codec),
-		control:       control,
-	}
-	return p, nil
+	control := NewAudioPlaybackControl(p)
+	return control, nil
 }
 
 // PlaybackRingtoneCreate is creating playback for ringtone
