@@ -6,19 +6,19 @@ package diago
 type AudioPlaybackControl struct {
 	AudioPlayback
 
-	stopper *AudioStopper
-	mutter  *AudioMuter
+	stopper *AudioStopperWriter
+	mutter  *AudioMuterWriter
 }
 
 func NewAudioPlaybackControl(a AudioPlayback) AudioPlaybackControl {
 	// Replace audio playback writer with control
 	writer := a.writer
 
-	mutter := &AudioMuter{
+	mutter := &AudioMuterWriter{
 		Writer: writer,
 	}
 
-	stopper := &AudioStopper{
+	stopper := &AudioStopperWriter{
 		Writer: mutter,
 	}
 

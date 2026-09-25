@@ -445,6 +445,30 @@ func WithAudioReaderDTMF(r *DTMFReader) AudioReaderOption {
 	}
 }
 
+// WithAudioReaderMuter adds a controllable mute stage to the audio reader pipeline.
+func WithAudioReaderMuter(muter *AudioMuterReader) AudioReaderOption {
+	return func(d *DialogMedia) error {
+		if muter == nil {
+			return fmt.Errorf("audio reader muter is nil")
+		}
+		muter.Reader = d.getAudioReader()
+		d.audioReader = muter
+		return nil
+	}
+}
+
+// WithAudioReaderStopper adds a controllable stop stage to the audio reader pipeline.
+func WithAudioReaderStopper(stopper *AudioStopperReader) AudioReaderOption {
+	return func(d *DialogMedia) error {
+		if stopper == nil {
+			return fmt.Errorf("audio reader stopper is nil")
+		}
+		stopper.Reader = d.getAudioReader()
+		d.audioReader = stopper
+		return nil
+	}
+}
+
 func WithAudioReaderPCMMonitor(mon *audio.MonitorPCMReader, w io.Writer) AudioReaderOption {
 	return func(d *DialogMedia) error {
 		codec := media.CodecAudioFromSession(d.mediaSession)
@@ -528,6 +552,30 @@ func WithAudioWriterDTMF(r *DTMFWriter) AudioWriterOption {
 	return func(d *DialogMedia) error {
 		r.dtmfWriter = media.NewRTPDTMFWriter(media.CodecTelephoneEvent8000, d.RTPPacketWriter, d.getAudioWriter())
 		d.audioWriter = r
+		return nil
+	}
+}
+
+// WithAudioWriterMuter adds a controllable mute stage to the audio writer pipeline.
+func WithAudioWriterMuter(muter *AudioMuterWriter) AudioWriterOption {
+	return func(d *DialogMedia) error {
+		if muter == nil {
+			return fmt.Errorf("audio writer muter is nil")
+		}
+		muter.Writer = d.getAudioWriter()
+		d.audioWriter = muter
+		return nil
+	}
+}
+
+// WithAudioWriterStopper adds a controllable stop stage to the audio writer pipeline.
+func WithAudioWriterStopper(stopper *AudioStopperWriter) AudioWriterOption {
+	return func(d *DialogMedia) error {
+		if stopper == nil {
+			return fmt.Errorf("audio writer stopper is nil")
+		}
+		stopper.Writer = d.getAudioWriter()
+		d.audioWriter = stopper
 		return nil
 	}
 }
