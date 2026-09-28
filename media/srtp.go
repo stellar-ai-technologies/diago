@@ -64,8 +64,10 @@ func parseSDESInline(value string) (key []byte, lifetime uint64, err error) {
 
 // Shared across session forks when the peer re-offers the same key. RTP and
 // RTCP have separate readers, but exhaustion of either retires the key for both.
+// ctx is the receive context for key, reused by forks to keep ROC and replay state.
 type sdesKeyLifetime struct {
 	key         []byte
+	ctx         *srtp.Context
 	mu          sync.Mutex
 	limit       uint64
 	rtpPackets  uint64

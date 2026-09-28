@@ -204,8 +204,11 @@ func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransacti
 
 	// When body is not present this can mean client is doing keep alive
 	// Still offer needs to be responded
+	var sd []byte
 	if req.Body() != nil {
-		if err := d.sdpReInviteUnsafe(req.Body()); err != nil {
+		var err error
+		sd, err = d.sdpReInviteUnsafe(req.Body())
+		if err != nil {
 			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - "+err.Error(), nil))
 		}
 
@@ -214,10 +217,11 @@ func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransacti
 			d.onMediaUpdate(d)
 			d.mu.Lock()
 		}
+	} else {
+		sd = d.mediaSession.LocalSDP()
 	}
 
 	// Reply with updated SDP
-	sd := d.mediaSession.LocalSDP()
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sd)
 	res.AppendHeader(contactHDR)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
@@ -225,15 +229,22 @@ func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransacti
 }
 
 // Must be protected with lock
-func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) error {
+// It returns the SDP answer. The answer is generated before the fork goes live, because
+// with SRTP it sets our new local key, which must not change under an active writer.
+func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) ([]byte, error) {
 	if d.mediaSession == nil {
-		return fmt.Errorf("no media session present")
+		return nil, fmt.Errorf("no media session present")
 	}
 
-	if err := d.sdpUpdateUnsafe(sdp); err != nil {
-		return err
+	msess := d.mediaSession.Fork()
+	if err := msess.RemoteSDP(sdp); err != nil {
+		return nil, fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
 	}
-	return nil
+	answer := msess.LocalSDP()
+	if err := d.replaceRTPSessionUnsafe(msess); err != nil {
+		return nil, err
+	}
+	return answer, nil
 }
 
 func (d *DialogMedia) checkEarlyMedia(remoteSDP []byte) error {
@@ -262,6 +273,11 @@ func (d *DialogMedia) mediaUpdateUnsafe(msess *media.MediaSession) error {
 // replaceRTPSessionUnsafe replaces the RTP session after the old monitor has
 // stopped using the shared sockets. A fork preserves statistics and shared connections; a new
 // session is used when media connections were recreated.
+//
+// msess goes live here, so its negotiation must be complete. A fork may share SRTP contexts
+// with the old session, and a pion srtp.Context is not goroutine safe. Sharing is safe because
+// RTP is read and written by one goroutine each through RTPPacketReader and RTPPacketWriter,
+// and the old RTCP monitor stops before the new one starts.
 func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 	oldRTPSess := d.rtpSession
 	if oldRTPSess == nil {

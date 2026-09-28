@@ -116,3 +116,71 @@ func TestMediaSDESLifetime(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoteSDPSameKeyKeepsROC(t *testing.T) {
+	key, err := base64.StdEncoding.DecodeString(sdesTestKey)
+	require.NoError(t, err)
+	sender, err := srtp.CreateContext(key[:16], key[16:], srtp.ProtectionProfileAes128CmHmacSha1_80)
+	require.NoError(t, err)
+	offer := sdesTestOffer("inline:" + sdesTestKey)
+
+	seq := uint16(65534)
+	read := func(m *MediaSession) error {
+		pkt := rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 8, SequenceNumber: seq, SSRC: 42}, Payload: []byte("audio")}
+		seq++
+		plain, err := pkt.Marshal()
+		require.NoError(t, err)
+		encrypted, err := sender.EncryptRTP(nil, plain, nil)
+		require.NoError(t, err)
+		m.rtpConn = &fakes.UDPConn{Reader: bytes.NewReader(encrypted)}
+		_, err = m.ReadRTP(make([]byte, RTPBufSize), &rtp.Packet{})
+		return err
+	}
+
+	m := &MediaSession{Codecs: []Codec{CodecAudioAlaw}, SecureRTP: 1, SRTPAlg: SRTPProfileAes128CmHmacSha1_80}
+	require.NoError(t, m.RemoteSDP(offer))
+	// Cross the sequence number wrap, so the sender's ROC is 1.
+	for range 4 {
+		require.NoError(t, read(m))
+	}
+	roc, ok := sender.ROC(42)
+	require.True(t, ok)
+	require.Equal(t, uint32(1), roc)
+
+	// Session refreshes re-offer the same key. A fresh context would guess ROC 0 and fail
+	// authentication on every packet.
+	for range 2 {
+		fork := m.Fork()
+		require.NoError(t, fork.RemoteSDP(offer))
+		require.Same(t, m.remoteCtxSRTP, fork.remoteCtxSRTP)
+		require.NoError(t, read(fork))
+		m = fork
+	}
+}
+
+func TestRemoteSDPNewKeyResetsContext(t *testing.T) {
+	m := &MediaSession{Codecs: []Codec{CodecAudioAlaw}, SecureRTP: 1, SRTPAlg: SRTPProfileAes128CmHmacSha1_80}
+	require.NoError(t, m.RemoteSDP(sdesTestOffer("inline:"+sdesTestKey)))
+	oldCtx := m.remoteCtxSRTP
+
+	// A new master key is a new crypto context with ROC 0 (RFC 4568 section 7.1.4).
+	key, err := base64.StdEncoding.DecodeString(sdesTestKey)
+	require.NoError(t, err)
+	key[0] ^= 1
+	fork := m.Fork()
+	require.NoError(t, fork.RemoteSDP(sdesTestOffer("inline:"+base64.StdEncoding.EncodeToString(key))))
+	require.NotSame(t, oldCtx, fork.remoteCtxSRTP)
+	require.Same(t, oldCtx, m.remoteCtxSRTP)
+
+	sender, err := srtp.CreateContext(key[:16], key[16:], srtp.ProtectionProfileAes128CmHmacSha1_80)
+	require.NoError(t, err)
+	plain, err := (&rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 8, SequenceNumber: 1234, SSRC: 42}, Payload: []byte("audio")}).Marshal()
+	require.NoError(t, err)
+	encrypted, err := sender.EncryptRTP(nil, plain, nil)
+	require.NoError(t, err)
+	fork.rtpConn = &fakes.UDPConn{Reader: bytes.NewReader(encrypted)}
+	pkt := rtp.Packet{}
+	_, err = fork.ReadRTP(make([]byte, RTPBufSize), &pkt)
+	require.NoError(t, err)
+	require.Equal(t, []byte("audio"), pkt.Payload)
+}

@@ -4,13 +4,17 @@
 package diago
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/emiago/diago/media"
+	"github.com/emiago/diago/media/sdp"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/stretchr/testify/assert"
@@ -168,6 +172,99 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	require.NoError(t, err)
 
 	d.Hangup(context.TODO())
+}
+
+func TestIntegrationDialogServerReinviteSRTP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	{
+		ua, _ := sipgo.NewUA()
+		defer ua.Close()
+
+		dg := NewDiago(ua, WithTransport(
+			Transport{
+				Transport: "tcp",
+				BindHost:  "127.0.0.1",
+				BindPort:  15543,
+				MediaSRTP: 1,
+			},
+		))
+		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+			if err := d.Answer(); err != nil {
+				t.Log("Failed to answer", err)
+				return
+			}
+			d.Echo()
+		})
+		require.NoError(t, err)
+	}
+
+	// The caller acts as a carrier that sends a session refresh.
+	ua, _ := sipgo.NewUA()
+	defer ua.Close()
+
+	dg := NewDiago(ua, WithTransport(
+		Transport{
+			Transport: "tcp",
+			BindHost:  "127.0.0.1",
+			BindPort:  15541,
+			MediaSRTP: 1,
+		},
+	))
+	dialog, err := dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15543}, InviteOptions{Transport: "tcp"})
+	require.NoError(t, err)
+	defer dialog.Close()
+
+	frame := bytes.Repeat([]byte{0x55}, 160)
+	echo := func() {
+		t.Helper()
+		w, err := dialog.AudioWriter()
+		require.NoError(t, err)
+		r, err := dialog.AudioReader()
+		require.NoError(t, err)
+		_, err = w.Write(frame)
+		require.NoError(t, err)
+		require.NoError(t, dialog.StopRTP(1, 2*time.Second))
+		buf := make([]byte, media.RTPBufSize)
+		n, err := r.Read(buf)
+		require.NoError(t, err)
+		assert.Equal(t, frame, buf[:n])
+	}
+	echo()
+
+	// The refresh repeats our offer with the version incremented, so the SRTP key is unchanged.
+	offer := dialog.InviteRequest.Body()
+	sd := sdp.SessionDescription{}
+	require.NoError(t, sdp.Unmarshal(offer, &sd))
+	si, err := sd.SessionInformation()
+	require.NoError(t, err)
+	oldOrigin := fmt.Sprintf("o=- %d %d ", si.SessionID, si.SessionVersion)
+	newOrigin := fmt.Sprintf("o=- %d %d ", si.SessionID, si.SessionVersion+1)
+	require.Contains(t, string(offer), oldOrigin)
+
+	req := sip.NewRequest(sip.INVITE, dialog.InviteResponse.Contact().Address)
+	req.AppendHeader(dialog.InviteRequest.Contact())
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	req.SetBody([]byte(strings.Replace(string(offer), oldOrigin, newOrigin, 1)))
+	res, err := dialog.reInviteDo(ctx, req)
+	require.NoError(t, err)
+	assert.Contains(t, string(res.Body()), "RTP/SAVP")
+
+	// Apply the answer. It carries a new key from the server.
+	err = func() error {
+		dialog.mu.Lock()
+		defer dialog.mu.Unlock()
+		ms := dialog.mediaSession.Fork()
+		if err := ms.RemoteSDP(res.Body()); err != nil {
+			return err
+		}
+		return dialog.mediaUpdateUnsafe(ms)
+	}()
+	require.NoError(t, err)
+
+	echo()
+	require.NoError(t, dialog.Hangup(ctx))
 }
 
 func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {

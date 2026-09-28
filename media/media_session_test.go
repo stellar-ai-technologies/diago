@@ -494,3 +494,62 @@ func TestMediaSessionRTPSymetric(t *testing.T) {
 	rtpLen := session.rtpConn.(*fakes.UDPConn).Writers["127.2.2.2:4321"].(*bytes.Buffer).Len()
 	assert.Greater(t, rtpLen, 0)
 }
+
+func TestMediaSessionForkSRTPReoffer(t *testing.T) {
+	// Opportunistic SRTP setting, where the profile follows the peer.
+	old := RTPProfileSAVPDisable
+	RTPProfileSAVPDisable = true
+	t.Cleanup(func() { RTPProfileSAVPDisable = old })
+
+	offer := sdesTestOffer("inline:" + sdesTestKey)
+	m := &MediaSession{
+		Codecs:    []Codec{CodecAudioAlaw},
+		Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000},
+		Mode:      sdp.ModeSendrecv,
+		SecureRTP: 1,
+		SRTPAlg:   SRTPProfileAes128CmHmacSha1_80,
+	}
+	require.NoError(t, m.RemoteSDP(offer))
+	m.LocalSDP()
+
+	// A re-INVITE is applied on a fork. A fork without SecureRTP and SRTPAlg rejects the
+	// RTP/SAVP re-offer, and the re-INVITE is answered 487.
+	fork := m.Fork()
+	require.NoError(t, fork.RemoteSDP(offer))
+	answer := string(fork.LocalSDP())
+	assert.Contains(t, answer, "m=audio 5000 RTP/SAVP 8\r\n")
+	assert.Contains(t, answer, "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:")
+
+	// Our own re-offer, like Hold, stays on the negotiated profile.
+	assert.Contains(t, string(m.Fork().LocalSDP()), "m=audio 5000 RTP/SAVP 8\r\n")
+}
+
+func TestMediaSessionForkKeepsLocalSRTP(t *testing.T) {
+	m := &MediaSession{
+		Codecs:    []Codec{CodecAudioAlaw},
+		Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000},
+		Mode:      sdp.ModeSendrecv,
+		SecureRTP: 1,
+		SRTPAlg:   SRTPProfileAes128CmHmacSha1_80,
+	}
+	offer := m.LocalSDP()
+	answer := sdesTestOffer("inline:" + sdesTestKey)
+	require.NoError(t, m.RemoteSDP(answer))
+
+	// Some forks apply an answer to our offer without calling LocalSDP: the 200 after early
+	// media, or the ACK after a re-INVITE without SDP. They must keep encrypting with the key
+	// from our offer instead of sending plaintext.
+	fork := m.Fork()
+	require.NoError(t, fork.RemoteSDP(answer))
+	sent := &bytes.Buffer{}
+	fork.rtpConn = &fakes.UDPConn{Writers: map[string]io.Writer{fork.Raddr.String(): sent}}
+	require.NoError(t, fork.WriteRTP(&rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 8, SequenceNumber: 1, SSRC: 42}, Payload: []byte("audio")}))
+
+	peer := &MediaSession{Codecs: []Codec{CodecAudioAlaw}, SRTPAlg: SRTPProfileAes128CmHmacSha1_80}
+	require.NoError(t, peer.RemoteSDP(offer))
+	peer.rtpConn = &fakes.UDPConn{Reader: sent}
+	pkt := rtp.Packet{}
+	_, err := peer.ReadRTP(make([]byte, RTPBufSize), &pkt)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("audio"), pkt.Payload)
+}

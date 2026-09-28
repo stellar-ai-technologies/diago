@@ -296,6 +296,8 @@ func (s *MediaSession) StartRTP(rw int8) error {
 
 // Fork is special call to be used in case when there is session update
 // It preserves pointer to same conneciton but rest is removed
+// SRTP settings and the local SRTP context are kept, so a fork keeps encrypting with the key
+// the peer already has until LocalSDP negotiates a new one.
 func (s *MediaSession) Fork() *MediaSession {
 	cp := MediaSession{
 		Laddr:              s.Laddr, // TODO clone it although it is read only
@@ -308,8 +310,12 @@ func (s *MediaSession) Fork() *MediaSession {
 		sdp:                slices.Clone(s.sdp),
 		sessionID:          s.sessionID,
 		sessionVersion:     s.sessionVersion,
+		SecureRTP:          s.SecureRTP,
+		SRTPAlg:            s.SRTPAlg,
 		DTLSConf:           s.DTLSConf,
+		localCtxSRTP:       s.localCtxSRTP,
 		remoteSDESLifetime: s.remoteSDESLifetime,
+		remoteProto:        s.remoteProto,
 	}
 	return &cp
 }
@@ -585,18 +591,21 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 			masterKey := keyBytes[:16]
 			masterSalt := keyBytes[16:]
 
-			ctx, err := srtp.CreateContext(masterKey, masterSalt, profile)
-			if err != nil {
-				return fmt.Errorf("CreateContext failed: %v", err)
-			}
-			s.remoteCtxSRTP = ctx
 			if prev := s.remoteSDESLifetime; prev != nil && bytes.Equal(prev.key, keyBytes) {
+				// Same master key keeps its crypto context (RFC 4568 section 7.1.4). A new context
+				// would reset the ROC and fail authentication once the peer's ROC is 1 or more.
+				s.remoteCtxSRTP = prev.ctx
 				// A re-offer cannot extend the lifetime of an existing master key.
 				prev.mu.Lock()
 				prev.limit = min(prev.limit, lifetime)
 				prev.mu.Unlock()
 			} else {
-				s.remoteSDESLifetime = &sdesKeyLifetime{key: keyBytes, limit: lifetime}
+				ctx, err := srtp.CreateContext(masterKey, masterSalt, profile)
+				if err != nil {
+					return fmt.Errorf("CreateContext failed: %v", err)
+				}
+				s.remoteCtxSRTP = ctx
+				s.remoteSDESLifetime = &sdesKeyLifetime{key: keyBytes, ctx: ctx, limit: lifetime}
 			}
 
 			break
