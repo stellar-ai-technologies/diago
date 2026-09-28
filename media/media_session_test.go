@@ -553,3 +553,39 @@ func TestMediaSessionForkKeepsLocalSRTP(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("audio"), pkt.Payload)
 }
+
+func TestMediaSessionOriginStableAcrossAnswer(t *testing.T) {
+	origin := func(body []byte) (uint64, uint64) {
+		sd := sdp.SessionDescription{}
+		require.NoError(t, sdp.Unmarshal(body, &sd))
+		si, err := sd.SessionInformation()
+		require.NoError(t, err)
+		return si.SessionID, si.SessionVersion
+	}
+	newSession := func() *MediaSession {
+		return &MediaSession{
+			Codecs: []Codec{CodecAudioAlaw},
+			Laddr:  net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000},
+			Mode:   sdp.ModeSendrecv,
+		}
+	}
+	peerSDP := []byte("v=0\r\no=- 100 100 IN IP4 127.0.0.1\r\ns=test\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 8\r\na=sendrecv\r\n")
+
+	// RFC 3264 section 8: our o= line only changes its version, whatever the peer sends.
+	offerer := newSession()
+	id, ver := origin(offerer.LocalSDP())
+	require.NoError(t, offerer.RemoteSDP(peerSDP))
+	reID, reVer := origin(offerer.Fork().LocalSDP())
+	assert.Equal(t, id, reID)
+	assert.Equal(t, ver+1, reVer)
+
+	answerer := newSession()
+	require.NoError(t, answerer.RemoteSDP(peerSDP))
+	id, ver = origin(answerer.LocalSDP())
+	assert.NotEqual(t, uint64(100), id)
+	fork := answerer.Fork()
+	require.NoError(t, fork.RemoteSDP(peerSDP))
+	reID, reVer = origin(fork.LocalSDP())
+	assert.Equal(t, id, reID)
+	assert.Equal(t, ver+1, reVer)
+}

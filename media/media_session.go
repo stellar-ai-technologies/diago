@@ -478,8 +478,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 		return fmt.Errorf("fail to parse received SDP: %w", err)
 	}
 
-	si, err := sd.SessionInformation()
-	if err != nil {
+	if _, err := sd.SessionInformation(); err != nil {
 		return err
 	}
 
@@ -489,9 +488,11 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 	//    of the answer is unrelated to the version number in the o line of the
 	//    offer.
 	answerer := s.sessionID == 0
-	if s.sessionID != si.SessionID {
-		s.sessionID = si.SessionID
-		s.sessionVersion = si.SessionVersion + 1
+	if answerer {
+		// Initialize our own origin. Adopting the peer's session id would change our o= line
+		// between SDPs, which RFC 3264 section 8 forbids.
+		s.sessionID = GetCurrentNTPTimestamp() >> 32
+		s.sessionVersion = s.sessionID
 	}
 	// TODO: check below. For now we expect and handle only single audio media
 	// For each "m=" line in the offer, there MUST be a corresponding "m="
