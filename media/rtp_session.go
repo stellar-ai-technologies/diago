@@ -87,7 +87,7 @@ type RTPReadStats struct {
 	// RTP reading stats
 	SampleRate uint32
 	// lastRTPTime       time.Time
-	// lastRTPTimestamp  uint32
+	lastRTPTimestamp  uint32
 	firstRTPTime      time.Time
 	firstRTPTimestamp uint32
 	jitter            float64
@@ -311,14 +311,24 @@ func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) 
 	ssrcChanged := stats.SSRC != readPkt.SSRC
 
 	var codec Codec
-	if ssrcChanged {
+	if ssrcChanged || stats.payloadType != readPkt.PayloadType {
 		var ok bool
 		codec, ok = codecByPayloadType(s.Sess.Codecs, readPkt.PayloadType)
 		if !ok {
 			return false
 		}
-	} else if stats.payloadType != readPkt.PayloadType {
-		return false
+		// The lock guards the audio decoder against a codec switch. Auxiliary
+		// payloads share the audio's SSRC and sequence space, so they are counted
+		// (or RTCP reports them lost) but neither set nor trip it.
+		if !ssrcChanged && !codec.IsAuxiliary() {
+			locked, _ := codecByPayloadType(s.Sess.Codecs, stats.payloadType)
+			if !locked.IsAuxiliary() {
+				return false
+			}
+			// First audio on an SSRC that began with auxiliary payloads.
+			stats.payloadType = readPkt.PayloadType
+			stats.SampleRate = codec.SampleRate
+		}
 	}
 
 	// For now we only track latest SSRC
@@ -348,7 +358,9 @@ func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) 
 			// Reset our firstRTPtime to improve jitter calc
 			stats.firstRTPTime = now
 			stats.firstRTPTimestamp = readPkt.Timestamp
-		} else {
+		} else if readPkt.Timestamp != stats.lastRTPTimestamp {
+			// A repeated timestamp adds no media time (RFC 4733 event updates and
+			// retransmits), so it has no transit to measure.
 			// https://datatracker.ietf.org/doc/html/rfc3550#page-39
 			stats.calcJitter(now, readPkt.Timestamp)
 		}
@@ -367,7 +379,7 @@ func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) 
 	}
 
 	// stats.lastRTPTime = now
-	// stats.lastRTPTimestamp = readPkt.Timestamp
+	stats.lastRTPTimestamp = readPkt.Timestamp
 
 	return true
 }

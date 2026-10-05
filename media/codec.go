@@ -61,9 +61,15 @@ func CodecAudioFromSession(s *MediaSession) Codec {
 	return codec
 }
 
+// IsAuxiliary reports whether c is an auxiliary RTP format (RFC 4733 events,
+// RFC 3389 comfort noise) carried beside the audio rather than decoded as it.
+func (c Codec) IsAuxiliary() bool {
+	return strings.EqualFold(c.Name, "telephone-event") || strings.EqualFold(c.Name, "CN")
+}
+
 func CodecAudioFromList(codecs []Codec) (Codec, bool) {
 	for _, codec := range codecs {
-		if codec.Name == "telephone-event" {
+		if codec.IsAuxiliary() {
 			continue
 		}
 
