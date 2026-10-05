@@ -76,6 +76,7 @@ type RTPReadStats struct {
 	FirstPktSequenceNumber uint16
 	LastSequenceNumber     uint16
 	payloadType            uint8
+	payloadTypeKnown       bool // checked against the current session's codecs
 	lastSeq                RTPExtendedSequenceNumber
 	// tracks first pkt seq in this interval to calculate loss of packets
 	IntervalFirstPktSeqNum uint16
@@ -85,9 +86,7 @@ type RTPReadStats struct {
 	OctetCount   uint64
 
 	// RTP reading stats
-	SampleRate uint32
-	// lastRTPTime       time.Time
-	lastRTPTimestamp  uint32
+	SampleRate        uint32
 	firstRTPTime      time.Time
 	firstRTPTimestamp uint32
 	jitter            float64
@@ -104,31 +103,17 @@ type RTPReadStats struct {
 	clockReset bool
 }
 
-/*
-	 func (stats *RTPReadStats) calcJitter(now time.Time, readPktTimestamp uint32) {
-		sampleRate := float64(stats.SampleRate)
-
-		// https://www.rfc-editor.org/rfc/rfc3550#appendix-A.8
-		// Jitter here will mostly be incorrect as Reading RTP can be faster slower
-		// and not actually dictated by sampling (clock)
-		Sij := readPktTimestamp - stats.lastRTPTimestamp
-		Rij := now.Sub(stats.lastRTPTime)
-		D := Rij.Seconds()*sampleRate - float64(Sij)
-		if D < 0 {
-			D = -D
-		}
-		stats.jitter = stats.jitter + (D-stats.jitter)/16
-	}
-*/
 func (stats *RTPReadStats) calcJitter(now time.Time, readPktTimestamp uint32) {
 	sampleRate := float64(stats.SampleRate)
 
 	// Calculate samples
 	// https://www.rfc-editor.org/rfc/rfc3550#appendix-A.8
 	rtpSampleArrival := stats.firstRTPTimestamp + uint32(now.Sub(stats.firstRTPTime).Seconds()*sampleRate)
-	transit := int64(rtpSampleArrival) - int64(readPktTimestamp)
+	// Subtract modulo 2^32 before interpreting the difference as signed,
+	// so arrival and RTP timestamp wrap do not produce a jitter spike.
+	transit := int64(int32(rtpSampleArrival - readPktTimestamp))
 
-	D := transit - stats.transit
+	D := int64(int32(transit - stats.transit))
 	stats.transit = transit
 
 	if D < 0 {
@@ -172,6 +157,8 @@ func (s *RTPSession) Fork(sess *MediaSession) *RTPSession {
 
 	fork := NewRTPSession(sess)
 	fork.readStats = s.readStats
+	// Payload mappings may change even when the SSRC and payload type stay the same.
+	fork.readStats.payloadTypeKnown = false
 	fork.writeStats = s.writeStats
 	fork.onReadRTCP = s.onReadRTCP
 	fork.onWriteRTCP = s.onWriteRTCP
@@ -307,28 +294,18 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 // updateReadStats updates the active RTP source and payload format.
 // s.rtcpMU must be held by the caller.
 func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) bool {
+	// Session codecs decide which payloads are supported. Readers above this
+	// layer handle their payload formats, including audio and telephone events.
 	stats := &s.readStats
 	ssrcChanged := stats.SSRC != readPkt.SSRC
 
-	var codec Codec
-	if ssrcChanged || stats.payloadType != readPkt.PayloadType {
-		var ok bool
-		codec, ok = codecByPayloadType(s.Sess.Codecs, readPkt.PayloadType)
-		if !ok {
+	sampleRate := stats.SampleRate
+	if ssrcChanged || !stats.payloadTypeKnown || stats.payloadType != readPkt.PayloadType {
+		codec, supported := codecByPayloadType(s.Sess.Codecs, readPkt.PayloadType)
+		if !supported {
 			return false
 		}
-		// The lock guards the audio decoder against a codec switch. Auxiliary
-		// payloads share the audio's SSRC and sequence space, so they are counted
-		// (or RTCP reports them lost) but neither set nor trip it.
-		if !ssrcChanged && !codec.IsAuxiliary() {
-			locked, _ := codecByPayloadType(s.Sess.Codecs, stats.payloadType)
-			if !locked.IsAuxiliary() {
-				return false
-			}
-			// First audio on an SSRC that began with auxiliary payloads.
-			stats.payloadType = readPkt.PayloadType
-			stats.SampleRate = codec.SampleRate
-		}
+		sampleRate = codec.SampleRate
 	}
 
 	// For now we only track latest SSRC
@@ -340,8 +317,7 @@ func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) 
 		*stats = RTPReadStats{
 			SSRC:                   readPkt.SSRC,
 			FirstPktSequenceNumber: readPkt.SequenceNumber,
-			payloadType:            readPkt.PayloadType,
-			SampleRate:             codec.SampleRate,
+			SampleRate:             sampleRate,
 			firstRTPTime:           now,
 			firstRTPTimestamp:      readPkt.Timestamp,
 		}
@@ -349,19 +325,20 @@ func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) 
 	} else {
 		stats.lastSeq.UpdateSeq(readPkt.SequenceNumber)
 
-		if stats.clockReset {
+		if stats.clockReset || stats.SampleRate != sampleRate {
+			// Transit values from different RTP clock rates cannot be compared.
+			stats.SampleRate = sampleRate
 			stats.firstRTPTime = now
 			stats.firstRTPTimestamp = readPkt.Timestamp
+			stats.jitter = 0
 			stats.transit = 0
 			stats.clockReset = false
 		} else if readPkt.Marker {
 			// Reset our firstRTPtime to improve jitter calc
 			stats.firstRTPTime = now
 			stats.firstRTPTimestamp = readPkt.Timestamp
-		} else if readPkt.Timestamp != stats.lastRTPTimestamp {
-			// A repeated timestamp adds no media time (RFC 4733 event updates and
-			// retransmits), so it has no transit to measure.
-			// https://datatracker.ietf.org/doc/html/rfc3550#page-39
+		} else {
+			// Include repeated timestamps from event updates and retransmissions.
 			stats.calcJitter(now, readPkt.Timestamp)
 		}
 
@@ -378,8 +355,8 @@ func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) 
 		stats.IntervalFirstPktSeqNum = readPkt.SequenceNumber
 	}
 
-	// stats.lastRTPTime = now
-	stats.lastRTPTimestamp = readPkt.Timestamp
+	stats.payloadType = readPkt.PayloadType
+	stats.payloadTypeKnown = true
 
 	return true
 }

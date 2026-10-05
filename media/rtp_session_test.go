@@ -4,6 +4,7 @@
 package media
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -131,7 +132,7 @@ func TestRTPSessionReadSkipsComfortNoise(t *testing.T) {
 	assert.EqualValues(t, 2, stats.OctetCount)
 }
 
-func TestRTPSessionReadSkipsPayloadTypeChange(t *testing.T) {
+func TestRTPSessionReadPassesSupportedPayloadTypeChanges(t *testing.T) {
 	rtpSessRead, rtpSessWrite := pipeRTP(9876, 1234)
 
 	const ssrc uint32 = 1234
@@ -180,21 +181,20 @@ func TestRTPSessionReadSkipsPayloadTypeChange(t *testing.T) {
 	}()
 
 	buf := make([]byte, RTPBufSize)
-	for _, wantSequenceNumber := range []uint16{1, 3} {
+	for i := range packets {
 		var pkt rtp.Packet
 		n, err := rtpSessRead.ReadRTP(buf, &pkt)
 		require.NoError(t, err)
 		require.Positive(t, n)
-		assert.Equal(t, CodecAudioAlaw.PayloadType, pkt.PayloadType)
-		assert.Equal(t, wantSequenceNumber, pkt.SequenceNumber)
+		assert.Equal(t, packets[i].PayloadType, pkt.PayloadType)
+		assert.Equal(t, packets[i].SequenceNumber, pkt.SequenceNumber)
 	}
 	require.NoError(t, <-writeDone)
 
 	stats := rtpSessRead.ReadStats()
-	assert.Equal(t, CodecAudioAlaw.PayloadType, stats.payloadType)
 	assert.EqualValues(t, CodecAudioAlaw.SampleRate, stats.SampleRate)
-	assert.EqualValues(t, 2, stats.PacketsCount)
-	assert.EqualValues(t, 2, stats.OctetCount)
+	assert.EqualValues(t, 3, stats.PacketsCount)
+	assert.EqualValues(t, 3, stats.OctetCount)
 }
 
 func TestRTPSessionReadPassesAuxiliaryOnAudioSSRC(t *testing.T) {
@@ -203,12 +203,13 @@ func TestRTPSessionReadPassesAuxiliaryOnAudioSSRC(t *testing.T) {
 
 	const ssrc uint32 = 1234
 	pts := []uint8{
-		CodecTelephoneEvent8000.PayloadType, // before any audio: must not lock the SSRC
+		CodecTelephoneEvent8000.PayloadType, // before any audio
 		CodecAudioAlaw.PayloadType,
 		CodecTelephoneEvent8000.PayloadType, // mid-call DTMF
 		CodecComfortNoise8000.PayloadType,   // negotiated CN
 		CodecAudioAlaw.PayloadType,
-		CodecAudioUlaw.PayloadType, // a real audio codec change is still rejected
+		CodecAudioUlaw.PayloadType, // supported audio codec changes also pass through
+		127,                        // unnegotiated payload remains rejected
 		CodecAudioAlaw.PayloadType,
 	}
 	packets := make([]rtp.Packet, len(pts))
@@ -237,7 +238,7 @@ func TestRTPSessionReadPassesAuxiliaryOnAudioSSRC(t *testing.T) {
 	}()
 
 	buf := make([]byte, RTPBufSize)
-	for _, wantSequenceNumber := range []uint16{1, 2, 3, 4, 5, 7} {
+	for _, wantSequenceNumber := range []uint16{1, 2, 3, 4, 5, 6, 8} {
 		var pkt rtp.Packet
 		n, err := rtpSessRead.ReadRTP(buf, &pkt)
 		require.NoError(t, err)
@@ -247,30 +248,212 @@ func TestRTPSessionReadPassesAuxiliaryOnAudioSSRC(t *testing.T) {
 	require.NoError(t, <-writeDone)
 
 	stats := rtpSessRead.ReadStats()
-	assert.Equal(t, CodecAudioAlaw.PayloadType, stats.payloadType)
 	assert.EqualValues(t, CodecAudioAlaw.SampleRate, stats.SampleRate)
-	assert.EqualValues(t, 6, stats.PacketsCount)
+	assert.EqualValues(t, 7, stats.PacketsCount)
 }
 
-func TestRTPSessionJitterSkipsRepeatedTimestamp(t *testing.T) {
+func TestRTPSessionReadSupportedClockRateChanges(t *testing.T) {
 	sess := fakeSession(9876, 1234, nil, nil, nil, nil)
-	sess.Sess.Codecs = append(sess.Sess.Codecs, CodecTelephoneEvent8000)
+	t.Cleanup(sess.rtcpTicker.Stop)
+	codec16k := Codec{Name: "custom-format", PayloadType: 112, SampleRate: 16000}
+	sess.Sess.Codecs = append(sess.Sess.Codecs, codec16k, CodecTelephoneEvent8000)
 
-	start := time.Now()
-	pkt := func(pt uint8, seq uint16, ts uint32) *rtp.Packet {
-		return &rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: pt, SequenceNumber: seq, Timestamp: ts, SSRC: 1}}
+	start := time.Unix(0, 0)
+	for i, a := range []struct {
+		codec     Codec
+		timestamp uint32
+	}{
+		{CodecAudioAlaw, 0},
+		{CodecAudioUlaw, 160},
+		{codec16k, 10000},
+		{codec16k, 10320},
+		{CodecTelephoneEvent8000, 777},
+		{CodecAudioAlaw, 937},
+	} {
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version: 2, PayloadType: a.codec.PayloadType, SequenceNumber: uint16(i + 1),
+				Timestamp: a.timestamp, SSRC: 1234,
+			},
+			Payload: []byte{1},
+		}
+		require.True(t, sess.updateReadStats(pkt, pkt.MarshalSize(), start.Add(time.Duration(i)*20*time.Millisecond)))
+		stats := sess.ReadStats()
+		assert.Equal(t, a.codec.SampleRate, stats.SampleRate)
+		assert.EqualValues(t, i+1, stats.PacketsCount)
+		assert.Zero(t, stats.jitter)
 	}
-	at := func(ms int) time.Time { return start.Add(time.Duration(ms) * time.Millisecond) }
+}
 
-	// Audio arriving exactly on its clock: no jitter.
-	require.True(t, sess.updateReadStats(pkt(CodecAudioAlaw.PayloadType, 1, 0), 13, at(0)))
-	require.True(t, sess.updateReadStats(pkt(CodecAudioAlaw.PayloadType, 2, 160), 13, at(20)))
-	// Event updates keep the event's start timestamp while time moves on.
-	for i := 0; i < 5; i++ {
-		require.True(t, sess.updateReadStats(pkt(CodecTelephoneEvent8000.PayloadType, uint16(3+i), 160), 16, at(40+20*i)))
+func TestRTPSessionReadValidatesFirstPayloadAfterSenderReport(t *testing.T) {
+	sess := fakeSession(9876, 1234, nil, nil, nil, nil)
+	t.Cleanup(sess.rtcpTicker.Stop)
+	sess.Sess.Codecs = []Codec{CodecAudioAlaw}
+	sess.readRTCPPacket(&rtcp.SenderReport{SSRC: 1234})
+	pkt := &rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: CodecAudioUlaw.PayloadType, SequenceNumber: 1, SSRC: 1234},
+		Payload: []byte{1},
 	}
-	assert.Zero(t, sess.readStats.jitter)
-	assert.EqualValues(t, 7, sess.readStats.PacketsCount)
+	assert.False(t, sess.updateReadStats(pkt, pkt.MarshalSize(), time.Unix(0, 0)))
+	assert.Zero(t, sess.ReadStats().PacketsCount)
+}
+
+func TestRTPSessionReadTelephoneEvents(t *testing.T) {
+	checkTelephoneEvents := func(t *testing.T, codec Codec, audioPackets int, negotiated bool, wantDigits string) {
+		t.Helper()
+		events := RTPDTMFEncode8000('5')
+
+		// Each reader holds one datagram; MultiReader returns one packet per Read.
+		var packets []io.Reader
+		addPacket := func(pt uint8, timestamp uint32, marker bool, payload []byte) {
+			pkt := rtp.Packet{
+				Header: rtp.Header{
+					Version: 2, PayloadType: pt, SequenceNumber: uint16(len(packets) + 1),
+					Timestamp: timestamp, SSRC: 1234, Marker: marker,
+				},
+				Payload: payload,
+			}
+			raw, err := pkt.Marshal()
+			require.NoError(t, err)
+			packets = append(packets, bytes.NewReader(raw))
+		}
+		for i := 0; i < audioPackets; i++ {
+			addPacket(CodecAudioAlaw.PayloadType, uint32(i*160), i == 0, []byte{1})
+		}
+		timestamp := uint32(audioPackets * 160)
+		for i, event := range events {
+			addPacket(codec.PayloadType, timestamp, i == 0, DTMFEncode(event))
+		}
+		addPacket(CodecAudioAlaw.PayloadType, timestamp+800, true, []byte{1})
+
+		read := fakeSession(9876, 1234, io.MultiReader(packets...), nil, nil, nil)
+		t.Cleanup(read.rtcpTicker.Stop)
+		if negotiated {
+			read.Sess.Codecs = append(read.Sess.Codecs, codec)
+		}
+		packetReader := NewRTPPacketReaderSession(read)
+		dtmfReader := NewRTPDTMFReader(codec, packetReader, packetReader)
+
+		var digits string
+		buf := make([]byte, RTPBufSize)
+		for {
+			_, err := dtmfReader.Read(buf)
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+			if digit, ok := dtmfReader.ReadDTMF(); ok {
+				digits += string(digit)
+			}
+		}
+		assert.Equal(t, wantDigits, digits)
+		wantPackets := audioPackets + 1
+		if negotiated {
+			wantPackets += len(events)
+		}
+		stats := read.ReadStats()
+		assert.EqualValues(t, wantPackets, stats.PacketsCount)
+		assert.Equal(t, CodecAudioAlaw.SampleRate, stats.SampleRate)
+	}
+
+	t.Run("audio before DTMF", func(t *testing.T) {
+		checkTelephoneEvents(t, CodecTelephoneEvent8000, 5, true, "5")
+	})
+
+	t.Run("DTMF before audio", func(t *testing.T) {
+		checkTelephoneEvents(t, CodecTelephoneEvent8000, 0, true, "5")
+	})
+
+	t.Run("negotiated dynamic payload type", func(t *testing.T) {
+		codec := CodecTelephoneEvent8000
+		codec.PayloadType = 110
+		checkTelephoneEvents(t, codec, 5, true, "5")
+	})
+
+	t.Run("unnegotiated telephone-event", func(t *testing.T) {
+		checkTelephoneEvents(t, CodecTelephoneEvent8000, 5, false, "")
+	})
+}
+
+func TestRTPSessionJitter(t *testing.T) {
+	type arrival struct {
+		pt        uint8
+		timestamp uint32
+		ms        int
+		marker    bool
+		jitter    float64
+	}
+	checkJitter := func(t *testing.T, arrivals []arrival) {
+		t.Helper()
+		sess := fakeSession(9876, 1234, nil, nil, nil, nil)
+		t.Cleanup(sess.rtcpTicker.Stop)
+		sess.Sess.Codecs = append(sess.Sess.Codecs, CodecTelephoneEvent8000)
+		start := time.Unix(0, 0)
+		for i, a := range arrivals {
+			pkt := &rtp.Packet{
+				Header: rtp.Header{
+					Version: 2, PayloadType: a.pt, SequenceNumber: uint16(i + 1),
+					Timestamp: a.timestamp, SSRC: 1, Marker: a.marker,
+				},
+				Payload: []byte{1},
+			}
+			now := start.Add(time.Duration(a.ms) * time.Millisecond)
+			require.True(t, sess.updateReadStats(pkt, pkt.MarshalSize(), now))
+			assert.InDelta(t, a.jitter, sess.readStats.jitter, 1e-9, "packet %d", i+1)
+		}
+		assert.EqualValues(t, len(arrivals), sess.ReadStats().PacketsCount)
+		var report rtcp.ReceptionReport
+		sess.parseReceptionReport(&report, start.Add(time.Second))
+		assert.EqualValues(t, uint32(arrivals[len(arrivals)-1].jitter), report.Jitter)
+	}
+
+	t.Run("telephone-event updates and end retransmissions", func(t *testing.T) {
+		// RFC 4733 section 2.5.2.2 includes packets with repeated
+		// timestamps in RTCP jitter. At 8 kHz, 20 ms is 160 ticks.
+		checkJitter(t, []arrival{
+			{8, 0, 0, false, 0},
+			{8, 160, 20, false, 0},
+			{101, 320, 40, true, 0},
+			{101, 320, 60, false, 10},
+			{101, 320, 80, false, 19.375},
+			{8, 800, 100, false, 38.1640625},
+		})
+	})
+
+	t.Run("telephone-event marker resets baseline", func(t *testing.T) {
+		checkJitter(t, []arrival{
+			{8, 0, 0, false, 0},
+			{8, 160, 20, false, 0},
+			{101, 320, 50, true, 0},
+			{8, 480, 60, false, 5},
+		})
+	})
+
+	t.Run("audio marker resets baseline", func(t *testing.T) {
+		checkJitter(t, []arrival{
+			{8, 0, 0, true, 0},
+			{8, 160, 20, false, 0},
+			{8, 320, 50, true, 0},
+			{8, 480, 60, false, 5},
+		})
+	})
+
+	t.Run("audio marker after paused stream", func(t *testing.T) {
+		checkJitter(t, []arrival{
+			{8, 0, 0, true, 0},
+			{8, 160, 20, false, 0},
+			{8, 320, 10000, true, 0},
+			{8, 480, 10020, false, 0},
+		})
+	})
+
+	t.Run("repeated event timestamp across clock wrap", func(t *testing.T) {
+		checkJitter(t, []arrival{
+			{8, 0xfffffff0, 0, false, 0},
+			{101, 0xfffffff0, 20, false, 10},
+			{8, 304, 40, false, 19.375},
+		})
+	})
 }
 
 func TestRTPSessionReadCodecChangesWithSSRC(t *testing.T) {
@@ -330,7 +513,6 @@ func TestRTPSessionReadCodecChangesWithSSRC(t *testing.T) {
 
 	stats := rtpSessRead.ReadStats()
 	assert.Equal(t, packets[1].SSRC, stats.SSRC)
-	assert.Equal(t, codec16k.PayloadType, stats.payloadType)
 	assert.EqualValues(t, codec16k.SampleRate, stats.SampleRate)
 	assert.EqualValues(t, 1, stats.PacketsCount)
 	assert.EqualValues(t, 1, stats.OctetCount)
