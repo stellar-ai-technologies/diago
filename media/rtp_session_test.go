@@ -285,17 +285,24 @@ func TestRTPSessionReadSupportedClockRateChanges(t *testing.T) {
 	}
 }
 
-func TestRTPSessionReadValidatesFirstPayloadAfterSenderReport(t *testing.T) {
+func TestRTPSessionReadRejectsUnnegotiatedPayloadAfterSenderReport(t *testing.T) {
 	sess := fakeSession(9876, 1234, nil, nil, nil, nil)
 	t.Cleanup(sess.rtcpTicker.Stop)
-	sess.Sess.Codecs = []Codec{CodecAudioAlaw}
-	sess.readRTCPPacket(&rtcp.SenderReport{SSRC: 1234})
+	sess.Sess.Codecs = []Codec{CodecAudioAlaw} // Only PCMA (PT 8) is negotiated.
+
+	// RTCP can establish the SSRC before the first RTP packet arrives.
+	const ssrc uint32 = 1234
+	sess.readRTCPPacket(&rtcp.SenderReport{SSRC: ssrc})
+	require.Equal(t, ssrc, sess.ReadStats().SSRC)
+
+	// PCMU (PT 0) matches the zero-valued payload cache, but has never been
+	// validated. A known SSRC must not let this unnegotiated payload through.
 	pkt := &rtp.Packet{
-		Header:  rtp.Header{Version: 2, PayloadType: CodecAudioUlaw.PayloadType, SequenceNumber: 1, SSRC: 1234},
+		Header:  rtp.Header{Version: 2, PayloadType: CodecAudioUlaw.PayloadType, SequenceNumber: 1, SSRC: ssrc},
 		Payload: []byte{1},
 	}
-	assert.False(t, sess.updateReadStats(pkt, pkt.MarshalSize(), time.Unix(0, 0)))
-	assert.Zero(t, sess.ReadStats().PacketsCount)
+	assert.False(t, sess.updateReadStats(pkt, pkt.MarshalSize(), time.Unix(0, 0)), "unnegotiated PT 0 must be rejected")
+	assert.Zero(t, sess.ReadStats().PacketsCount, "rejected RTP must not be counted")
 }
 
 func TestRTPSessionReadTelephoneEvents(t *testing.T) {
