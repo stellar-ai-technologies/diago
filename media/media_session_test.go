@@ -198,6 +198,45 @@ func TestMediaSessionOriginStableAcrossAnswer(t *testing.T) {
 	assert.Equal(t, offerVersion+1, reofferVersion)
 }
 
+// A late-offer re-INVITE: our live session re-offers (new local key) and the
+// peer's answer, carried in the ACK, is applied on a fork. The fork must keep
+// encrypting with the key we offered.
+func TestMediaSessionForkLateOfferAnswerKeepsLocalSRTP(t *testing.T) {
+	newSession := func() *MediaSession {
+		m := &MediaSession{
+			Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+			Codecs:    []Codec{CodecAudioAlaw},
+			SecureRTP: 1,
+			SRTPAlg:   SRTPProfileAes128CmHmacSha1_80,
+			Mode:      sdp.ModeSendrecv,
+		}
+		require.NoError(t, m.Init())
+		t.Cleanup(func() { m.Close() })
+		return m
+	}
+	us, peer := newSession(), newSession()
+	require.NoError(t, peer.RemoteSDP(us.LocalSDP()))
+	require.NoError(t, us.RemoteSDP(peer.LocalSDP()))
+
+	reoffer := us.LocalSDP()
+	peerFork := peer.Fork()
+	require.NoError(t, peerFork.RemoteSDP(reoffer))
+	ackAnswer := peerFork.LocalSDP()
+
+	usFork := us.Fork()
+	require.NoError(t, usFork.RemoteSDP(ackAnswer))
+
+	pkt := &rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: 8, SequenceNumber: 1, Timestamp: 160, SSRC: 0xdeadbeef},
+		Payload: []byte("srtp after late offer"),
+	}
+	require.NoError(t, usFork.WriteRTP(pkt))
+	got := rtp.Packet{}
+	_, err := peerFork.ReadRTP(make([]byte, RTPBufSize), &got)
+	require.NoError(t, err, "fork must encrypt with the key from our re-offer")
+	assert.Equal(t, pkt.Payload, got.Payload)
+}
+
 func TestMediaSessionUpdateCodec(t *testing.T) {
 	newM := func() *MediaSession {
 		return &MediaSession{
