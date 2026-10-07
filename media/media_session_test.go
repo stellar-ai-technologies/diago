@@ -5,8 +5,10 @@ package media
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/emiago/diago/media/sdp"
@@ -137,6 +139,63 @@ func TestMediaSessionForkPreservesExternalIP(t *testing.T) {
 	connInfo, err := sd.ConnectionInformation()
 	require.NoError(t, err)
 	assert.Equal(t, m.ExternalIP.To4(), connInfo.IP.To4())
+}
+
+func TestMediaSessionForkSRTPReoffer(t *testing.T) {
+	m := &MediaSession{
+		Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+		Codecs:    []Codec{CodecAudioAlaw},
+		Mode:      sdp.ModeSendrecv,
+		SecureRTP: 1,
+		SRTPAlg:   SRTPProfileAes128CmHmacSha1_80,
+	}
+	offer := sdesTestOffer("inline:" + sdesTestKey)
+	require.NoError(t, m.RemoteSDP(offer))
+
+	fork := m.Fork()
+	require.NoError(t, fork.RemoteSDP(offer), "a fork must accept an RTP/SAVP re-offer")
+	assert.Equal(t, "RTP/SAVP", fork.remoteProto)
+
+	answer := sdp.SessionDescription{}
+	require.NoError(t, sdp.Unmarshal(fork.LocalSDP(), &answer))
+	md, err := answer.MediaDescription("audio")
+	require.NoError(t, err)
+	assert.Equal(t, "RTP/SAVP", md.Proto)
+	assert.Contains(t, strings.Join(answer.Values("a"), "\n"), "crypto:1 AES_CM_128_HMAC_SHA1_80 inline:")
+}
+
+func TestMediaSessionOriginStableAcrossAnswer(t *testing.T) {
+	newSession := func() *MediaSession {
+		return &MediaSession{
+			Laddr:  net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+			Codecs: []Codec{CodecAudioAlaw},
+			Mode:   sdp.ModeSendrecv,
+		}
+	}
+	origin := func(b []byte) (uint64, uint64) {
+		t.Helper()
+		sd := sdp.SessionDescription{}
+		require.NoError(t, sdp.Unmarshal(b, &sd))
+		si, err := sd.SessionInformation()
+		require.NoError(t, err)
+		return si.SessionID, si.SessionVersion
+	}
+
+	peerSDP := func(id int) []byte {
+		return []byte(fmt.Sprintf("v=0\r\no=- %d %d IN IP4 127.0.0.2\r\ns=peer\r\nc=IN IP4 127.0.0.2\r\nt=0 0\r\nm=audio 4000 RTP/AVP 8\r\na=sendrecv\r\n", id, id))
+	}
+
+	answerer := newSession()
+	require.NoError(t, answerer.RemoteSDP(peerSDP(100)))
+	answerID, _ := origin(answerer.LocalSDP())
+	assert.NotEqual(t, uint64(100), answerID, "the answerer must not adopt the offerer's session id")
+
+	offerer := newSession()
+	offerID, offerVersion := origin(offerer.LocalSDP())
+	require.NoError(t, offerer.RemoteSDP(peerSDP(200)))
+	reofferID, reofferVersion := origin(offerer.Fork().LocalSDP())
+	assert.Equal(t, offerID, reofferID, "the offerer's session id must survive the answer")
+	assert.Equal(t, offerVersion+1, reofferVersion)
 }
 
 func TestMediaSessionUpdateCodec(t *testing.T) {

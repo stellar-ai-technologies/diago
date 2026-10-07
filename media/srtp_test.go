@@ -102,7 +102,6 @@ func TestMediaSDESLifetime(t *testing.T) {
 			require.ErrorContains(t, read(exhaustRTCP, false), "SDES key lifetime exhausted")
 			// Re-offering the same key on a fork must not replenish its budget.
 			m = m.Fork()
-			m.SRTPAlg = SRTPProfileAes128CmHmacSha1_80
 			require.NoError(t, m.RemoteSDP(offer))
 			require.ErrorContains(t, read(exhaustRTCP, false), "SDES key lifetime exhausted")
 			// A different master key has its own packet budget.
@@ -115,4 +114,59 @@ func TestMediaSDESLifetime(t *testing.T) {
 			require.ErrorContains(t, read(exhaustRTCP, false), "SDES key lifetime exhausted")
 		})
 	}
+}
+
+// sdesReadRTP encrypts one RTP packet with sender and reads it through m.
+func sdesReadRTP(t *testing.T, m *MediaSession, sender *srtp.Context, seq uint16) error {
+	t.Helper()
+	pkt := rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 8, SequenceNumber: seq, SSRC: 42}, Payload: []byte("audio")}
+	plain, err := pkt.Marshal()
+	require.NoError(t, err)
+	encrypted, err := sender.EncryptRTP(nil, plain, nil)
+	require.NoError(t, err)
+	m.rtpConn = &fakes.UDPConn{Reader: bytes.NewReader(encrypted)}
+	read := rtp.Packet{}
+	_, err = m.ReadRTP(make([]byte, RTPBufSize), &read)
+	return err
+}
+
+func TestRemoteSDPSameKeyKeepsROC(t *testing.T) {
+	key, err := base64.StdEncoding.DecodeString(sdesTestKey)
+	require.NoError(t, err)
+	sender, err := srtp.CreateContext(key[:16], key[16:], srtp.ProtectionProfileAes128CmHmacSha1_80)
+	require.NoError(t, err)
+
+	offer := sdesTestOffer("inline:" + sdesTestKey)
+	m := &MediaSession{Codecs: []Codec{CodecAudioAlaw}, SecureRTP: 1, SRTPAlg: SRTPProfileAes128CmHmacSha1_80}
+	require.NoError(t, m.RemoteSDP(offer))
+
+	// Cross the sequence wrap so both sides move to ROC 1.
+	for _, seq := range []uint16{65534, 65535, 0, 1} {
+		require.NoError(t, sdesReadRTP(t, m, sender, seq))
+	}
+
+	// A session refresh re-offers the same key, twice.
+	for range 2 {
+		m = m.Fork()
+		require.NoError(t, m.RemoteSDP(offer))
+	}
+	require.NoError(t, sdesReadRTP(t, m, sender, 2), "same-key re-offer must keep the rollover counter")
+}
+
+func TestRemoteSDPNewKeyResetsContext(t *testing.T) {
+	m := &MediaSession{Codecs: []Codec{CodecAudioAlaw}, SecureRTP: 1, SRTPAlg: SRTPProfileAes128CmHmacSha1_80}
+	require.NoError(t, m.RemoteSDP(sdesTestOffer("inline:"+sdesTestKey)))
+	oldCtx := m.remoteCtxSRTP
+
+	key, err := base64.StdEncoding.DecodeString(sdesTestKey)
+	require.NoError(t, err)
+	key[0] ^= 1
+	fork := m.Fork()
+	require.NoError(t, fork.RemoteSDP(sdesTestOffer("inline:"+base64.StdEncoding.EncodeToString(key))))
+	require.NotSame(t, oldCtx, fork.remoteCtxSRTP)
+
+	// A fresh context for the new key starts at ROC 0.
+	sender, err := srtp.CreateContext(key[:16], key[16:], srtp.ProtectionProfileAes128CmHmacSha1_80)
+	require.NoError(t, err)
+	require.NoError(t, sdesReadRTP(t, fork, sender, 100))
 }

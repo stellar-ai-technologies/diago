@@ -65,7 +65,11 @@ func parseSDESInline(value string) (key []byte, lifetime uint64, err error) {
 // Shared across session forks when the peer re-offers the same key. RTP and
 // RTCP have separate readers, but exhaustion of either retires the key for both.
 type sdesKeyLifetime struct {
-	key         []byte
+	key []byte
+	// ctx is the remote context for key, reused by forks so ROC and replay
+	// state survive a same-key re-offer. pion contexts are not goroutine safe;
+	// see DialogMedia.replaceRTPSessionUnsafe for the single-reader invariant.
+	ctx         *srtp.Context
 	mu          sync.Mutex
 	limit       uint64
 	rtpPackets  uint64

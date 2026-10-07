@@ -170,6 +170,127 @@ func TestIntegrationDialogServerReinvite(t *testing.T) {
 	d.Hangup(context.TODO())
 }
 
+// A re-INVITE that carries an RTP/SAVP offer on an established SDES-SRTP call
+// must be answered 200 and keep media flowing.
+func TestIntegrationDialogServerReinviteSRTP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srtpTransport := func(port int) DiagoOption {
+		return WithTransport(Transport{
+			ID:        "tcp",
+			Transport: "tcp",
+			BindHost:  "127.0.0.1",
+			BindPort:  port,
+			MediaSRTP: 1,
+		})
+	}
+	codecs := WithMediaConfig(MediaConfig{Codecs: []media.Codec{media.CodecAudioUlaw}})
+
+	mediaUpdated := make(chan struct{}, 1)
+	callerDialog := make(chan *DialogClientSession, 1)
+	{
+		ua, _ := sipgo.NewUA(sipgo.WithUserAgent("caller"))
+		defer ua.Close()
+
+		dg := NewDiago(ua, srtpTransport(15446), codecs)
+		// The caller must serve to receive the in-dialog re-INVITE.
+		require.NoError(t, dg.ServeBackground(ctx, nil))
+
+		go func() {
+			dialog, err := dg.NewDialog(sip.Uri{User: "callee", Host: "127.0.0.1", Port: 15445}, NewDialogOptions{Transport: "tcp"})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer dialog.Close()
+			err = dialog.Invite(ctx, InviteClientOptions{
+				OnMediaUpdate: func(d *DialogMedia) {
+					mediaUpdated <- struct{}{}
+				},
+			})
+			if err == nil {
+				err = dialog.Ack(ctx)
+			}
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			callerDialog <- dialog
+			<-dialog.Context().Done()
+		}()
+	}
+
+	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("callee"))
+	defer ua.Close()
+
+	dg := NewDiago(ua, srtpTransport(15445), codecs)
+	waitDialog := make(chan *DialogServerSession)
+	err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		waitDialog <- d
+		<-d.Context().Done()
+	})
+	require.NoError(t, err)
+	d := <-waitDialog
+	require.NoError(t, d.Answer())
+	caller := <-callerDialog
+
+	// The caller keeps sending while it answers the re-offer, so -race sees any
+	// SRTP state the answer touches after the fork carries live media.
+	callerWriter, err := caller.AudioWriter()
+	require.NoError(t, err)
+	stopSending := make(chan struct{})
+	sending := make(chan struct{})
+	go func() {
+		defer close(sending)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopSending:
+				return
+			case <-ticker.C:
+				if _, err := callerWriter.Write(make([]byte, 160)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	require.NoError(t, d.ReInvite(d.Context()))
+	select {
+	case <-mediaUpdated:
+	case <-time.After(time.Second):
+		t.Fatal("caller did not apply the SRTP re-offer")
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(stopSending)
+	<-sending
+
+	// Media sent with the re-offered key reaches the caller.
+	r, err := caller.AudioReader()
+	require.NoError(t, err)
+	w, err := d.AudioWriter()
+	require.NoError(t, err)
+	frame := make([]byte, 160)
+	_, err = w.Write(frame)
+	require.NoError(t, err)
+
+	read := make(chan error, 1)
+	go func() {
+		_, err := r.Read(make([]byte, 160))
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("no media after SRTP re-INVITE")
+	}
+
+	d.Hangup(context.TODO())
+}
+
 func TestIntegrationDialogServerPeerCodecPruneReinvite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
