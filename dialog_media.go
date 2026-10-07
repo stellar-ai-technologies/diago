@@ -50,6 +50,8 @@ type DialogMedia struct {
 	mediaSession *media.MediaSession
 	// Pending fork used while a locally initiated SDP offer waits for its answer.
 	pendingMediaSession *media.MediaSession
+	// pendingAnswer is the answer to a remote re-offer, built before its fork went live.
+	pendingAnswer []byte
 
 	// rtp session is created for usage with RTPPacketReader and RTPPacketWriter
 	// it adds RTCP layer and RTP monitoring before passing packets to MediaSession
@@ -271,6 +273,23 @@ func (d *DialogMedia) sdpUpdateUnsafe(sdp []byte) error {
 	return d.replaceRTPSessionUnsafe(msess)
 }
 
+// sdpOfferUpdateUnsafe applies a remote re-offer on a fork and keeps the answer
+// for onLocalSDP. The answer is built before the fork goes live: LocalSDP sets
+// the local SRTP context that the RTP writer reads, so it must not run while
+// media is already flowing through the fork.
+func (d *DialogMedia) sdpOfferUpdateUnsafe(sdp []byte) error {
+	msess := d.mediaSession.Fork()
+	if err := msess.RemoteSDP(sdp); err != nil {
+		return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
+	}
+	answer := msess.LocalSDP()
+	if err := d.replaceRTPSessionUnsafe(msess); err != nil {
+		return err
+	}
+	d.pendingAnswer = answer
+	return nil
+}
+
 func (d *DialogMedia) mediaUpdateUnsafe(msess *media.MediaSession) error {
 	return d.replaceRTPSessionUnsafe(msess)
 }
@@ -278,6 +297,11 @@ func (d *DialogMedia) mediaUpdateUnsafe(msess *media.MediaSession) error {
 // replaceRTPSessionUnsafe replaces the RTP session after the old monitor has
 // fully stopped. A fork preserves statistics and shared connections; a new
 // session is used when media connections were recreated.
+//
+// A fork may share the remote SRTP context with the session it replaces (same-key
+// re-offer). pion's srtp.Context is not goroutine safe, so this relies on the old
+// RTCP monitor stopping before the new one starts, and on RTP being decrypted by a
+// single reader that moves to the new session through RTPPacketReader.
 func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 	oldRTPSess := d.rtpSession
 	if oldRTPSess == nil {
@@ -325,7 +349,7 @@ func (d *DialogMedia) onRemoteSDP(ctx context.Context, remoteSDP []byte, offered
 			d.pendingMediaSession = nil
 		}
 	} else {
-		err = d.sdpUpdateUnsafe(remoteSDP)
+		err = d.sdpOfferUpdateUnsafe(remoteSDP)
 	}
 	onMediaUpdate := d.onMediaUpdate
 	d.mu.Unlock()
@@ -347,6 +371,10 @@ func (d *DialogMedia) onLocalSDP(ctx context.Context, answered bool, mode string
 	}
 
 	if answered {
+		if answer := d.pendingAnswer; answer != nil {
+			d.pendingAnswer = nil
+			return answer, nil
+		}
 		return d.mediaSession.LocalSDP(), nil
 	}
 
