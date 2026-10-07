@@ -304,9 +304,11 @@ func (s *MediaSession) StartRTP(rw int8) error {
 // Fork is special call to be used in case when there is session update
 // It preserves pointer to same conneciton but rest is removed
 //
-// The SRTP configuration is kept so a secure re-offer can be answered. SRTP
-// contexts are not copied: the next answer generates a fresh local key, and
-// RemoteSDP reuses the remote context only when the peer keeps its key.
+// The SRTP configuration and the local SRTP context are kept, so a fork that
+// only applies an answer to our last offer (a late-offer ACK) keeps encrypting
+// with the key we advertised. LocalSDP replaces the local context whenever the
+// fork sends a new offer or answer, and RemoteSDP reuses the remote context only
+// when the peer keeps its key.
 func (s *MediaSession) Fork() *MediaSession {
 	cp := MediaSession{
 		Laddr:          s.Laddr, // TODO clone it although it is read only
@@ -323,6 +325,7 @@ func (s *MediaSession) Fork() *MediaSession {
 		SRTPAlg:        s.SRTPAlg,
 		remoteProto:    s.remoteProto,
 		remoteSDES:     s.remoteSDES,
+		localCtxSRTP:   s.localCtxSRTP,
 		DTLSConf:       s.DTLSConf,
 	}
 	return &cp
