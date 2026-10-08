@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 
@@ -22,7 +23,7 @@ func sdesTestOffer(key string) []byte {
 }
 
 func TestRemoteSDP_SDESLifetime(t *testing.T) {
-	for _, suffix := range []string{"", "|2^31", "|2147483648", "|1", "|2^0", "|2^48", "|281474976710656"} {
+	for _, suffix := range []string{"", "|2^31", "|2147483648", "|1", "|2^0", "|2^48", "|281474976710656", "|1:4", "|2^31|1:4"} {
 		t.Run("valid"+suffix, func(t *testing.T) {
 			m := MediaSession{Codecs: []Codec{CodecAudioAlaw}, SRTPAlg: SRTPProfileAes128CmHmacSha1_80}
 			require.NoError(t, m.RemoteSDP(sdesTestOffer("inline:"+sdesTestKey+suffix)))
@@ -35,7 +36,10 @@ func TestRemoteSDP_SDESLifetime(t *testing.T) {
 		"inline:" + sdesTestKey + "|-1", "inline:" + sdesTestKey + "|2^",
 		"inline:" + sdesTestKey + "|2^031", "inline:" + sdesTestKey + "|2^49",
 		"inline:" + sdesTestKey + "|281474976710657", "inline:" + sdesTestKey + "|18446744073709551616",
-		"inline:" + sdesTestKey + "|1:4", "inline:" + sdesTestKey + "|2^31|1:4",
+		"inline:" + sdesTestKey + "|1:0", "inline:" + sdesTestKey + "|1:129",
+		"inline:" + sdesTestKey + "|256:1", "inline:" + sdesTestKey + "|x:1",
+		"inline:" + sdesTestKey + "|1:", "inline:" + sdesTestKey + "|:1",
+		"inline:" + sdesTestKey + "|1:1|2^31", "inline:" + sdesTestKey + "|2^31|2^31|1:1",
 		"inline:" + sdesTestKey + ";inline:" + sdesTestKey,
 		"inline:bad-key|2^31", "inline:YWJj|2^31", "other:" + sdesTestKey,
 	} {
@@ -169,4 +173,116 @@ func TestRemoteSDPNewKeyResetsContext(t *testing.T) {
 	sender, err := srtp.CreateContext(key[:16], key[16:], srtp.ProtectionProfileAes128CmHmacSha1_80)
 	require.NoError(t, err)
 	require.NoError(t, sdesReadRTP(t, fork, sender, 100))
+}
+
+func TestParseSDESInlineMKI(t *testing.T) {
+	for _, tc := range []struct {
+		params   string
+		lifetime uint64
+		mki      []byte
+	}{
+		{"", sdesMaxRTPPackets, nil},
+		{"|2^31", 1 << 31, nil},
+		{"|1:1", sdesMaxRTPPackets, []byte{1}},
+		{"|2^31|1:1", 1 << 31, []byte{1}},
+		{"|2^20|258:2", 1 << 20, []byte{1, 2}},
+		{"|255:1", sdesMaxRTPPackets, []byte{255}},
+		{"|0:4", sdesMaxRTPPackets, []byte{0, 0, 0, 0}},
+	} {
+		t.Run(tc.params, func(t *testing.T) {
+			key, lifetime, mki, err := parseSDESInline("inline:" + sdesTestKey + tc.params)
+			require.NoError(t, err)
+			require.Len(t, key, 30)
+			require.Equal(t, tc.lifetime, lifetime)
+			require.Equal(t, tc.mki, mki)
+		})
+	}
+}
+
+// sdesLocalKey returns the inline value, key and MKI of the crypto line in a
+// local SDP.
+func sdesLocalKey(t *testing.T, localSDP []byte) (inline string, key []byte, mki []byte) {
+	t.Helper()
+	for _, line := range strings.Split(string(localSDP), "\r\n") {
+		if crypto, ok := strings.CutPrefix(line, "a=crypto:"); ok {
+			vals := strings.Split(crypto, " ")
+			require.Len(t, vals, 3)
+			key, _, mki, err := parseSDESInline(vals[2])
+			require.NoError(t, err)
+			return vals[2], key, mki
+		}
+	}
+	t.Fatalf("no crypto line in %q", localSDP)
+	return "", nil, nil
+}
+
+func TestSDESMKIRoundTrip(t *testing.T) {
+	key, err := base64.StdEncoding.DecodeString(sdesTestKey)
+	require.NoError(t, err)
+	newSession := func() *MediaSession {
+		return &MediaSession{
+			Codecs:    []Codec{CodecAudioAlaw},
+			Mode:      "sendrecv",
+			Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4000},
+			SecureRTP: 1,
+			SRTPAlg:   SRTPProfileAes128CmHmacSha1_80,
+		}
+	}
+
+	t.Run("without MKI", func(t *testing.T) {
+		m := newSession()
+		require.NoError(t, m.RemoteSDP(sdesTestOffer("inline:"+sdesTestKey+"|2^31")))
+		inline, _, mki := sdesLocalKey(t, m.LocalSDP())
+		require.Nil(t, mki)
+		require.NotContains(t, inline, "|")
+	})
+
+	t.Run("with MKI", func(t *testing.T) {
+		m := newSession()
+		offer := sdesTestOffer("inline:" + sdesTestKey + "|2^31|7:2")
+		require.NoError(t, m.RemoteSDP(offer))
+
+		// Packets from the peer carry its 2-byte MKI.
+		sender, err := srtp.CreateContext(key[:16], key[16:], srtp.ProtectionProfileAes128CmHmacSha1_80, srtp.MasterKeyIndicator([]byte{0, 7}))
+		require.NoError(t, err)
+		require.NoError(t, sdesReadRTP(t, m, sender, 1))
+
+		// Our answer carries a 1-byte MKI, and our packets decrypt with it.
+		inline, localKey, localMKI := sdesLocalKey(t, m.LocalSDP())
+		require.True(t, strings.HasSuffix(inline, "|2^31|1:1"), inline)
+		require.Equal(t, []byte{1}, localMKI)
+		receiver, err := srtp.CreateContext(localKey[:16], localKey[16:], srtp.ProtectionProfileAes128CmHmacSha1_80, srtp.MasterKeyIndicator(localMKI))
+		require.NoError(t, err)
+		plain, err := (&rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 8, SequenceNumber: 1, SSRC: 7}, Payload: []byte("audio")}).Marshal()
+		require.NoError(t, err)
+		encrypted, err := m.localCtxSRTP.EncryptRTP(nil, plain, nil)
+		require.NoError(t, err)
+		decrypted, err := receiver.DecryptRTP(nil, encrypted, nil)
+		require.NoError(t, err)
+		require.Equal(t, plain, decrypted)
+
+		// A fork keeps answering with an MKI, and a same-key re-offer keeps the
+		// remote context.
+		remoteCtx := m.remoteCtxSRTP
+		fork := m.Fork()
+		require.NoError(t, fork.RemoteSDP(offer))
+		require.Same(t, remoteCtx, fork.remoteCtxSRTP)
+		require.NoError(t, sdesReadRTP(t, fork, sender, 2))
+		_, _, localMKI = sdesLocalKey(t, fork.LocalSDP())
+		require.Equal(t, []byte{1}, localMKI)
+
+		// The same key under a different MKI gets a fresh context.
+		fork = fork.Fork()
+		require.NoError(t, fork.RemoteSDP(sdesTestOffer("inline:"+sdesTestKey+"|2^31|8:2")))
+		require.NotSame(t, remoteCtx, fork.remoteCtxSRTP)
+		sender, err = srtp.CreateContext(key[:16], key[16:], srtp.ProtectionProfileAes128CmHmacSha1_80, srtp.MasterKeyIndicator([]byte{0, 8}))
+		require.NoError(t, err)
+		require.NoError(t, sdesReadRTP(t, fork, sender, 3))
+
+		// A re-offer without an MKI drops it from our answer.
+		fork = fork.Fork()
+		require.NoError(t, fork.RemoteSDP(sdesTestOffer("inline:"+sdesTestKey)))
+		_, _, localMKI = sdesLocalKey(t, fork.LocalSDP())
+		require.Nil(t, localMKI)
+	})
 }

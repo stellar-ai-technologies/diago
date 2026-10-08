@@ -22,50 +22,93 @@ const (
 
 var errSDESLifetimeExhausted = errors.New("SDES key lifetime exhausted")
 
-func parseSDESInline(value string) (key []byte, lifetime uint64, err error) {
+// RFC 4568 section 6.1 caps the MKI length at 128 bytes.
+const sdesMaxMKILength = 128
+
+// When the peer's key carries an MKI, ours does too, in the form Microsoft-style
+// peers use: a 2^31 lifetime and a 1-byte MKI of 1. Some of them reject a key
+// without an MKI once they have offered one.
+const sdesLocalMKIParams = "|2^31|1:1"
+
+var sdesLocalMKI = []byte{1}
+
+// parseSDESInline parses inline:<key||salt>["|" lifetime]["|" MKI ":" length].
+// The MKI is returned as length big-endian bytes, or nil when absent.
+func parseSDESInline(value string) (key []byte, lifetime uint64, mki []byte, err error) {
 	inline, ok := strings.CutPrefix(value, "inline:")
 	if !ok {
-		return nil, 0, errors.New("unsupported SDES key method")
+		return nil, 0, nil, errors.New("unsupported SDES key method")
 	}
 	if strings.Contains(inline, ";") {
-		return nil, 0, errors.New("multiple SDES keys are not supported")
+		return nil, 0, nil, errors.New("multiple SDES keys are not supported")
 	}
-	encoded, suffix, hasLifetime := strings.Cut(inline, "|")
-	lifetime = sdesMaxRTPPackets
-	if hasLifetime {
-		if strings.ContainsAny(suffix, "|:") {
-			return nil, 0, errors.New("SDES MKI is not supported")
+	params := strings.Split(inline, "|")
+	encoded, params := params[0], params[1:]
+	if n := len(params); n > 0 && strings.Contains(params[n-1], ":") {
+		mki, err = parseSDESMKI(params[n-1])
+		if err != nil {
+			return nil, 0, nil, err
 		}
-		digits, powerOfTwo := strings.CutPrefix(suffix, "2^")
+		params = params[:n-1]
+	}
+	if len(params) > 1 {
+		return nil, 0, nil, errors.New("invalid SDES key parameters")
+	}
+	lifetime = sdesMaxRTPPackets
+	if len(params) == 1 {
+		digits, powerOfTwo := strings.CutPrefix(params[0], "2^")
 		// RFC 4568 section 6.1 forbids leading zeroes despite the broader ABNF.
 		if len(digits) > 1 && digits[0] == '0' {
-			return nil, 0, errors.New("invalid SDES key lifetime")
+			return nil, 0, nil, errors.New("invalid SDES key lifetime")
 		}
 		lifetime, err = strconv.ParseUint(digits, 10, 64)
 		if err != nil {
-			return nil, 0, errors.New("invalid SDES key lifetime")
+			return nil, 0, nil, errors.New("invalid SDES key lifetime")
 		}
 		if powerOfTwo {
 			if lifetime > 48 {
-				return nil, 0, errors.New("SDES key lifetime exceeds crypto-suite limit")
+				return nil, 0, nil, errors.New("SDES key lifetime exceeds crypto-suite limit")
 			}
 			lifetime = uint64(1) << lifetime
 		}
 		if lifetime == 0 || lifetime > sdesMaxRTPPackets {
-			return nil, 0, errors.New("invalid SDES key lifetime")
+			return nil, 0, nil, errors.New("invalid SDES key lifetime")
 		}
 	}
 	key, err = base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to decode SDES key: %w", err)
+		return nil, 0, nil, fmt.Errorf("failed to decode SDES key: %w", err)
 	}
-	return key, lifetime, nil
+	return key, lifetime, mki, nil
+}
+
+// parseSDESMKI parses the decimal "<value>:<length>" MKI parameter.
+func parseSDESMKI(param string) ([]byte, error) {
+	valueStr, lengthStr, _ := strings.Cut(param, ":")
+	value, err := strconv.ParseUint(valueStr, 10, 64)
+	if err != nil {
+		return nil, errors.New("invalid SDES MKI value")
+	}
+	length, err := strconv.ParseUint(lengthStr, 10, 8)
+	if err != nil || length == 0 || length > sdesMaxMKILength {
+		return nil, errors.New("invalid SDES MKI length")
+	}
+	mki := make([]byte, length)
+	for i := len(mki) - 1; i >= 0 && value > 0; i-- {
+		mki[i] = byte(value)
+		value >>= 8
+	}
+	if value > 0 {
+		return nil, errors.New("SDES MKI value exceeds its length")
+	}
+	return mki, nil
 }
 
 // Shared across session forks when the peer re-offers the same key. RTP and
 // RTCP have separate readers, but exhaustion of either retires the key for both.
 type sdesKeyLifetime struct {
 	key []byte
+	mki []byte
 	// ctx is the remote context for key, reused by forks so ROC and replay
 	// state survive a same-key re-offer. pion contexts are not goroutine safe;
 	// see DialogMedia.replaceRTPSessionUnsafe for the single-reader invariant.

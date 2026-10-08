@@ -168,6 +168,9 @@ type MediaSession struct {
 	remoteCtxSRTP      *srtp.Context
 	srtpRemoteTag      int
 	remoteSDESLifetime *sdesKeyLifetime
+	// sdesMKI is set once the peer's SDES key carries an MKI, so our keys carry
+	// one too.
+	sdesMKI bool
 
 	// RTP NAT enables handling RTP behind NAT. Checkout also RTPSourceLock
 	RTPNAT          int // 0 - disabled, 1 - Learn source change (RTP Symetric)
@@ -320,6 +323,7 @@ func (s *MediaSession) Fork() *MediaSession {
 		localCtxSRTP:       s.localCtxSRTP,
 		DTLSConf:           s.DTLSConf,
 		remoteSDESLifetime: s.remoteSDESLifetime,
+		sdesMKI:            s.sdesMKI,
 	}
 	return &cp
 }
@@ -390,7 +394,12 @@ func (s *MediaSession) LocalSDP() []byte {
 					tag:    1,
 				}
 
-				ctx, err := srtp.CreateContext(masterKey, masterSalt, profile)
+				var opts []srtp.ContextOption
+				if s.sdesMKI {
+					localSDES.params = sdesLocalMKIParams
+					opts = append(opts, srtp.MasterKeyIndicator(sdesLocalMKI))
+				}
+				ctx, err := srtp.CreateContext(masterKey, masterSalt, profile, opts...)
 				if err != nil {
 					return fmt.Errorf("CreateContext failed: %v", err)
 				}
@@ -577,7 +586,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 				continue
 			}
 
-			keyBytes, lifetime, err := parseSDESInline(vals[2])
+			keyBytes, lifetime, mki, err := parseSDESInline(vals[2])
 			if err != nil {
 				return err
 			}
@@ -588,7 +597,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 			masterKey := keyBytes[:16]
 			masterSalt := keyBytes[16:]
 
-			if prev := s.remoteSDESLifetime; prev != nil && prev.ctx != nil && bytes.Equal(prev.key, keyBytes) {
+			if prev := s.remoteSDESLifetime; prev != nil && prev.ctx != nil && bytes.Equal(prev.key, keyBytes) && bytes.Equal(prev.mki, mki) {
 				// Same key: keep the context so the rollover counter and replay
 				// state survive. A fresh context would guess ROC 0 and fail
 				// authentication once the peer's ROC has advanced.
@@ -598,13 +607,14 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 				prev.limit = min(prev.limit, lifetime)
 				prev.mu.Unlock()
 			} else {
-				ctx, err := srtp.CreateContext(masterKey, masterSalt, profile)
+				ctx, err := srtp.CreateContext(masterKey, masterSalt, profile, srtp.MasterKeyIndicator(mki))
 				if err != nil {
 					return fmt.Errorf("CreateContext failed: %v", err)
 				}
 				s.remoteCtxSRTP = ctx
-				s.remoteSDESLifetime = &sdesKeyLifetime{key: keyBytes, limit: lifetime, ctx: ctx}
+				s.remoteSDESLifetime = &sdesKeyLifetime{key: keyBytes, mki: mki, limit: lifetime, ctx: ctx}
 			}
+			s.sdesMKI = mki != nil
 
 			break
 		}
@@ -1202,6 +1212,8 @@ func StringRTCP(p rtcp.Packet) string {
 type sdesInline struct {
 	alg    string
 	base64 string
+	// params holds the optional "|" lifetime and MKI suffix of the key.
+	params string
 	tag    int
 }
 
@@ -1261,7 +1273,7 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 		"a="+string(mode))
 
 	if sdes.alg != "" {
-		s = append(s, fmt.Sprintf("a=crypto:%d %s inline:%s", sdes.tag, sdes.alg, sdes.base64))
+		s = append(s, fmt.Sprintf("a=crypto:%d %s inline:%s%s", sdes.tag, sdes.alg, sdes.base64, sdes.params))
 	}
 
 	if dtlsSet != nil {
