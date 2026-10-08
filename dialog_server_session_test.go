@@ -187,6 +187,19 @@ func TestIntegrationDialogServerReinviteSRTP(t *testing.T) {
 	}
 	codecs := WithMediaConfig(MediaConfig{Codecs: []media.Codec{media.CodecAudioUlaw}})
 
+	// The callee listens before the caller dials: SIP over TCP makes one dial
+	// attempt and has no retransmission to recover from a refused connection.
+	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("callee"))
+	defer ua.Close()
+
+	dg := NewDiago(ua, srtpTransport(15445), codecs)
+	waitDialog := make(chan *DialogServerSession)
+	err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+		waitDialog <- d
+		<-d.Context().Done()
+	})
+	require.NoError(t, err)
+
 	mediaUpdated := make(chan struct{}, 1)
 	callerDialog := make(chan *DialogClientSession, 1)
 	{
@@ -221,16 +234,6 @@ func TestIntegrationDialogServerReinviteSRTP(t *testing.T) {
 		}()
 	}
 
-	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("callee"))
-	defer ua.Close()
-
-	dg := NewDiago(ua, srtpTransport(15445), codecs)
-	waitDialog := make(chan *DialogServerSession)
-	err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
-		waitDialog <- d
-		<-d.Context().Done()
-	})
-	require.NoError(t, err)
 	d := <-waitDialog
 	require.NoError(t, d.Answer())
 	caller := <-callerDialog
